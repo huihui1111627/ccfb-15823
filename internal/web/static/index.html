@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P2C 客户端负载均衡 · 流量分布</title>
+<style>
+  :root {
+    --bg: #0f141b; --panel: #171e28; --panel2: #1e2733; --line: #2a3543;
+    --text: #dce3ec; --muted: #8595a8; --accent: #4ea1ff; --good: #3fce7e;
+    --warn: #f0b450; --bad: #f06a6a; --purple: #b08cff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 13px/1.5 -apple-system, "PingFang SC", "Microsoft YaHei", monospace; }
+  header { padding: 14px 22px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  .pill { background: var(--panel2); border: 1px solid var(--line); border-radius: 999px;
+    padding: 3px 12px; color: var(--muted); }
+  .pill b { color: var(--accent); }
+  main { padding: 18px 22px; display: grid; gap: 16px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 14px 16px; }
+  section h2 { font-size: 13px; margin: 0 0 10px; color: var(--muted); font-weight: 600;
+    text-transform: uppercase; letter-spacing: .08em; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; }
+  .card { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+  .card .k { color: var(--muted); font-size: 11px; }
+  .card .v { font-size: 20px; margin-top: 2px; }
+  .v.good { color: var(--good); } .v.warn { color: var(--warn); } .v.bad { color: var(--bad); }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { padding: 6px 8px; text-align: right; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--muted); font-weight: 500; position: sticky; top: 0; background: var(--panel); }
+  tr:hover td { background: var(--panel2); }
+  .table-wrap { max-height: 420px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
+  .bar { height: 6px; border-radius: 3px; background: var(--accent); min-width: 2px; display: inline-block; vertical-align: middle; }
+  .bar.warm { background: var(--purple); }
+  .bar.util { background: var(--good); }
+  .bar.lat { background: var(--warn); }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 1100px) { .grid2 { grid-template-columns: 1fr; } }
+  .fail { color: var(--bad); font-weight: 600; }
+  .ok { color: var(--good); font-weight: 600; }
+  button { background: var(--accent); color: #08111e; border: 0; border-radius: 7px;
+    padding: 7px 16px; font-weight: 600; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  #bench { white-space: pre-wrap; font-size: 12px; color: var(--muted); margin-top: 10px; }
+  .muted { color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>🐝 P2C 客户端负载均衡 · 实时流量分布</h1>
+  <span class="pill">策略 <b id="strategy">-</b></span>
+  <span class="pill">可用后端 <b id="available">-</b></span>
+  <span class="pill">总在途 <b id="inflight">-</b></span>
+  <span class="pill">排队中 <b id="queued">-</b></span>
+  <span class="pill">刷新 1s</span>
+</header>
+<main>
+  <section>
+    <h2>全局概览 · 延迟分位数 / 排队 / 失败</h2>
+    <div class="cards" id="cards"></div>
+  </section>
+
+  <section>
+    <h2>① 各后端请求量与在途数　② 延迟估计　③ 选中次数与权重对照（利用率见末列）</h2>
+    <div class="table-wrap">
+      <table id="backends">
+        <thead><tr>
+          <th>后端</th><th>权重</th><th>预热系数</th><th>选中次数</th><th>请求量占比</th>
+          <th>在途</th><th>完成</th><th>超时</th><th>兜底回收</th>
+          <th>延迟估计(ms)</th><th>利用率</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p class="muted" style="margin:8px 2px 0">蓝条=请求量占比，紫条=预热系数，黄条=延迟估计（相对最大值），绿条=利用率。</p>
+  </section>
+
+  <section class="grid2">
+    <div>
+      <h2>排队等待分布 (ms)</h2>
+      <div class="cards" id="queueCards"></div>
+    </div>
+    <div>
+      <h2>因无可用后端失败的请求</h2>
+      <div class="cards" id="failCards"></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>四策略对比基准（固定种子，短时长压测）</h2>
+    <button id="runBench">运行 20s 对比基准</button>
+    <div id="bench" class="muted">点击按钮运行 p2c / 轮询 / 纯随机 / 只看在途 P2C 的尾延迟对比与正确性校验。</div>
+  </section>
+</main>
+
+<script>
+const fmt = (x, d=2) => x == null ? '-' : Number(x).toFixed(d);
+const el = id => document.getElementById(id);
+
+async function tick() {
+  try {
+    const s = await (await fetch('/api/snapshot')).json();
+    render(s);
+  } catch (e) { /* 页面保持上一次数据 */ }
+}
+
+function render(s) {
+  el('strategy').textContent = s.strategy;
+  el('available').textContent = s.available_count;
+  el('inflight').textContent = s.total_inflight;
+  el('queued').textContent = s.queued_now;
+
+  const L = s.latency_ms, Q = s.queue_wait_ms;
+  el('cards').innerHTML = [
+    card('总选中', s.total_picked), card('总完成', s.total_completed),
+    card('总在途', s.total_inflight), card('排队超时', s.queue_timeouts, s.queue_timeouts ? 'bad':'good'),
+    card('P50 ms', fmt(L.p50)), card('P90 ms', fmt(L.p90)),
+    card('P99 ms', fmt(L.p99), 'warn'), card('P99.9 ms', fmt(L.p999), 'bad'),
+    card('最大排队 ms', fmt(s.queue_wait_max && s.queue_wait_max/1e6 || 0)),
+  ].join('');
+
+  el('queueCards').innerHTML = [
+    card('P50', fmt(Q.p50)), card('P90', fmt(Q.p90)),
+    card('P99', fmt(Q.p99)), card('Max', fmt(Q.max), 'warn'),
+  ].join('');
+  el('failCards').innerHTML = [
+    card('排队超时数', s.queue_timeouts, s.queue_timeouts ? 'bad':'good'),
+    card('当前排队', s.queued_now, s.queued_now ? 'warn':'good'),
+    card('兜底回收总数', s.total_swept, s.total_swept ? 'bad':'good'),
+    card('请求超时/取消', s.total_timeout, s.total_timeout ? 'warn':'good'),
+  ].join('');
+
+  const maxPicked = Math.max(1, ...s.backends.map(b => b.picked));
+  const maxLat = Math.max(1, ...s.backends.map(b => b.latency_estimate_ms));
+  const tb = el('backends').querySelector('tbody');
+  tb.innerHTML = s.backends.map(b => {
+    const sharePct = s.total_picked ? (b.picked / s.total_picked * 100) : 0;
+    return `<tr>
+      <td>${b.id}</td>
+      <td>${fmt(b.weight,1)} <span class="muted">/ 有效 ${fmt(b.effective_weight,2)}</span></td>
+      <td>${fmt(b.warmup_factor,2)} <span class="bar warm" style="width:${b.warmup_factor*40}px"></span></td>
+      <td>${b.picked}</td>
+      <td><span class="bar" style="width:${b.picked/maxPicked*90}px"></span> ${fmt(sharePct,1)}%</td>
+      <td>${b.inflight}</td>
+      <td>${b.completed}</td>
+      <td>${b.timed_out}</td>
+      <td class="${b.swept ? 'fail':''}">${b.swept}</td>
+      <td>${fmt(b.latency_estimate_ms)} <span class="bar lat" style="width:${b.latency_estimate_ms/maxLat*50}px"></span></td>
+      <td>${fmt(b.utilization*100,1)}% <span class="bar util" style="width:${b.utilization*40}px"></span></td>
+    </tr>`;
+  }).join('');
+}
+
+function card(k, v, cls='') {
+  return `<div class="card"><div class="k">${k}</div><div class="v ${cls}">${v}</div></div>`;
+}
+
+el('runBench').onclick = async (e) => {
+  const btn = e.target; btn.disabled = true;
+  el('bench').textContent = '基准运行中，约 20 秒×4 策略…';
+  try {
+    const r = await (await fetch('/api/benchmark', {method:'POST'})).json();
+    let txt = r.table + '\n\n校验结果：\n';
+    txt += `权重正比（健康稳态·权重档聚合，最大相对偏差 ${(r.checks.weight.max_dev*100).toFixed(1)}%，容忍 12%）：`
+      + (r.checks.weight.pass ? ' 通过 ✅' : ' 失败 ❌') + '\n';
+    txt += `排队不超过上限（max ${fmt(r.checks.queue.queue_max_ms)}ms / 上限 ${fmt(r.checks.queue.limit_ms)}ms）：`
+      + (r.checks.queue.pass ? ' 通过 ✅' : ' 失败 ❌') + '\n';
+    txt += `在途无泄漏：` + (r.checks.leak.pass ? ' 通过 ✅' : ' 失败 ❌');
+    el('bench').textContent = txt;
+  } catch (err) {
+    el('bench').textContent = '基准运行失败：' + err;
+  } finally { btn.disabled = false; }
+};
+
+tick();
+setInterval(tick, 1000);
+</script>
+</body>
+</html>
